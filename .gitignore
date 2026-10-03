@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+*/node_modules/
+
+# Environment files & secrets
+.env
+.env.*
+*/.env
+*/.env.*
+!.env.example
+*/!.env.example
+
+# Build outputs
+build/
+*/build/
+dist/
+*/dist/
+
+# Hardhat artifacts & cache
+smart-contracts/artifacts/
+smart-contracts/cache/
+
+# OS files
+.DS_Store
+*/.DS_Store
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

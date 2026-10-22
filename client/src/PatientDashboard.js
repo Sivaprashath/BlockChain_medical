@@ -5,13 +5,17 @@ import {
   Wallet, UploadCloud, Users, FileText, RefreshCw, ExternalLink,
   Inbox, Search, BadgeCheck, Building2, Stethoscope, Copy,
   CheckCircle2, Shield, Activity, Clock, X, AlertCircle,
-  FlaskConical, Pill, ScanLine, FileQuestion
+  FlaskConical, Pill, ScanLine, FileQuestion, Bell, CheckCircle, XCircle
 } from "lucide-react";
 import MedicalRecordArtifact from "./MedicalRecord.json";
+import { encryptMedicalFile } from "./utils/cryptoUtils";
+import RecordViewerModal from "./RecordViewerModal";
+import { ShieldCheck } from "lucide-react";
 
 const CONTRACT_ADDRESS = process.env.REACT_APP_CONTRACT_ADDRESS || "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 const PINATA_JWT = process.env.REACT_APP_PINATA_JWT;
-const AUTH_API  = "http://localhost:5001/api/auth";
+const AUTH_API  = process.env.REACT_APP_API_URL || "http://localhost:5001/api/auth";
+const ACCESS_REQ_API = process.env.REACT_APP_API_URL?.replace("/api/auth", "/api/access-requests") || "http://localhost:5001/api/access-requests";
 
 const RECORD_TYPES = [
   { id: "Lab Report",   icon: FlaskConical,  color: "teal"   },
@@ -76,6 +80,7 @@ function PatientDashboard({ user, activeTab, onWalletConnect }) {
   const [uploading, setUploading]         = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [dragging, setDragging]           = useState(false);
+  const [selectedRecordForViewer, setSelectedRecordForViewer] = useState(null);
   const fileInputRef = useRef();
 
   // Doctor access
@@ -84,6 +89,11 @@ function PatientDashboard({ user, activeTab, onWalletConnect }) {
   const [searchingDocs, setSearchingDocs] = useState(false);
   const [selectedDoctor, setSelectedDoctor] = useState(null);
   const [doctorPermissions, setDoctorPermissions] = useState({ view: false, upload: false, loading: false });
+
+  // Incoming Access Requests State
+  const [accessRequests, setAccessRequests] = useState([]);
+  const [requestsLoading, setRequestsLoading] = useState(false);
+  const [processingReq, setProcessingReq] = useState({});
 
   const checkDoctorPermissions = useCallback(async (doc) => {
     if (!contract || !account || !doc?.walletAddress) return;
@@ -179,35 +189,47 @@ function PatientDashboard({ user, activeTab, onWalletConnect }) {
     if (!contract || !selectedFile) { toast("Connect your wallet and choose a file first.", "error"); return; }
     try {
       setUploading(true);
-      setUploadProgress(20);
+      setUploadProgress(15);
+      toast("Encrypting file with AES-256-GCM before IPFS upload…", "info", "Security Layer");
 
+      // 1. Client-side AES-256 Encryption & SHA-256 Fingerprint: H = SHA256(Fenc)
+      const encResult = await encryptMedicalFile(selectedFile, account);
+      const encryptedFile = encResult.encryptedFile;
+      const fileHash = encResult.fileHash;
+
+      setUploadProgress(35);
+      toast("Uploading encrypted payload (Fenc) to IPFS…", "info", "Off-Chain Storage");
+
+      // 2. Upload Encrypted File to Pinata IPFS
       const formData = new FormData();
-      formData.append("file", selectedFile);
+      formData.append("file", encryptedFile);
       const pinRes = await axios.post(
         "https://api.pinata.cloud/pinning/pinFileToIPFS",
         formData,
         {
           headers: { "Content-Type": "multipart/form-data", Authorization: `Bearer ${PINATA_JWT}` },
-          onUploadProgress: p => setUploadProgress(Math.round(20 + (p.loaded / p.total) * 50)),
+          onUploadProgress: p => setUploadProgress(Math.round(35 + (p.loaded / p.total) * 40)),
         }
       );
 
-      const ipfsHash = pinRes.data.IpfsHash;
+      const ipfsCID = pinRes.data.IpfsHash;
       setUploadProgress(75);
-      toast("File pinned to IPFS — writing to blockchain…", "warning", "Processing");
+      toast("Writing CID & SHA-256 hash to blockchain… Confirm MetaMask signature", "warning", "Blockchain Registration");
 
-      const tx = await contract.uploadRecord(ipfsHash, recordType, description);
+      // 3. Register on Ethereum Smart Contract (CID + SHA-256 + recordType + description)
+      const tx = await contract.uploadRecord(ipfsCID, fileHash, recordType, description);
       setUploadProgress(90);
       await tx.wait();
       setUploadProgress(100);
 
-      toast(`Record uploaded successfully!`, "success", "Upload Complete");
+      toast("Record encrypted with AES-256 & registered on-chain!", "success", "Upload Complete");
       setSelectedFile(null);
       setDescription("");
       setTimeout(() => setUploadProgress(0), 1000);
       loadRecords();
     } catch (e) {
-      toast(e.message, "error", "Upload Failed");
+      console.error("Upload error:", e);
+      toast(e.reason || e.message, "error", "Upload Failed");
       setUploadProgress(0);
     } finally { setUploading(false); }
   };
@@ -275,6 +297,76 @@ function PatientDashboard({ user, activeTab, onWalletConnect }) {
   };
 
   // ── Determine what to show based on activeTab ──────────────────────────────
+  // Fetch incoming access requests
+  const fetchAccessRequests = useCallback(async () => {
+    setRequestsLoading(true);
+    try {
+      const token = localStorage.getItem("token");
+      const res = await axios.get(
+        `${ACCESS_REQ_API}/my-requests`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setAccessRequests(res.data);
+    } catch (e) {
+      console.error("Failed to fetch access requests", e);
+    } finally {
+      setRequestsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchAccessRequests();
+  }, [fetchAccessRequests]);
+
+  const handleApproveRequest = async (req) => {
+    if (!contract) { toast("Connect wallet first to grant on-chain access.", "error"); return; }
+    setProcessingReq(p => ({ ...p, [req._id]: "approving" }));
+    try {
+      const token = localStorage.getItem("token");
+      // 1. Grant on-chain access based on requestType
+      if (req.requestType === "view" || req.requestType === "both") {
+        const tx = await contract.grantAccess(req.doctorWallet);
+        await tx.wait();
+      }
+      if (req.requestType === "upload" || req.requestType === "both") {
+        const tx2 = await contract.grantUploadPermission(req.doctorWallet);
+        await tx2.wait();
+      }
+      // 2. Update status in DB
+      await axios.patch(
+        `${ACCESS_REQ_API}/${req._id}/approve`,
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      toast(`Access granted to Dr. ${req.doctorName}`, "success", "Access Granted");
+      fetchAccessRequests();
+    } catch (e) {
+      toast(e?.response?.data?.message || e?.message || "Failed to grant access.", "error");
+    } finally {
+      setProcessingReq(p => ({ ...p, [req._id]: null }));
+    }
+  };
+
+  const handleRejectRequest = async (req) => {
+    setProcessingReq(p => ({ ...p, [req._id]: "rejecting" }));
+    try {
+      const token = localStorage.getItem("token");
+      await axios.patch(
+        `${ACCESS_REQ_API}/${req._id}/reject`,
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      toast(`Request from Dr. ${req.doctorName} rejected.`, "success", "Request Rejected");
+      fetchAccessRequests();
+    } catch (e) {
+      toast(e?.response?.data?.message || "Failed to reject request.", "error");
+    } finally {
+      setProcessingReq(p => ({ ...p, [req._id]: null }));
+    }
+  };
+
+  const pendingCount = accessRequests.filter(r => r.status === "pending").length;
+
   const showDashboard = activeTab === "dashboard";
   const showRecords   = activeTab === "records";
   const showAccess    = activeTab === "access";
@@ -391,10 +483,13 @@ function PatientDashboard({ user, activeTab, onWalletConnect }) {
                         </div>
                       </div>
                       <div className="record-actions">
-                        <a className="btn btn-ghost btn-icon" href={"https://gateway.pinata.cloud/ipfs/" + r.fileHash} target="_blank" rel="noreferrer" title="View file">
+                        <button className="btn btn-outline btn-sm" onClick={() => setSelectedRecordForViewer(r)} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                          <ShieldCheck size={13} color="#10b981" /> Verify & Decrypt
+                        </button>
+                        <a className="btn btn-ghost btn-icon" href={"https://gateway.pinata.cloud/ipfs/" + (r.ipfsCID || r[0] || r.fileHash)} target="_blank" rel="noreferrer" title="View Encrypted IPFS Payload">
                           <ExternalLink size={14} />
                         </a>
-                        <button className="btn btn-ghost btn-icon" onClick={() => copyToClipboard(r.fileHash)} title="Copy hash">
+                        <button className="btn btn-ghost btn-icon" onClick={() => copyToClipboard(r.fileHash || r[1] || r.ipfsCID)} title="Copy hash">
                           <Copy size={14} />
                         </button>
                       </div>
@@ -537,10 +632,13 @@ function PatientDashboard({ user, activeTab, onWalletConnect }) {
                             </div>
                           </div>
                           <div className="record-actions">
-                            <a className="btn btn-outline btn-sm" href={link} target="_blank" rel="noreferrer">
-                              <ExternalLink size={13} /> View
+                            <button className="btn btn-primary btn-sm" onClick={() => setSelectedRecordForViewer(r)} style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                              <ShieldCheck size={14} /> Verify & Decrypt
+                            </button>
+                            <a className="btn btn-ghost btn-icon" href={"https://gateway.pinata.cloud/ipfs/" + (r.ipfsCID || r[0] || r.fileHash)} target="_blank" rel="noreferrer" title="View Encrypted IPFS Payload">
+                              <ExternalLink size={13} />
                             </a>
-                            <button className="btn btn-ghost btn-icon" onClick={() => copyToClipboard(r.fileHash)} title="Copy hash">
+                            <button className="btn btn-ghost btn-icon" onClick={() => copyToClipboard(r.fileHash || r[1] || r.ipfsCID)} title="Copy hash">
                               <Copy size={14} />
                             </button>
                           </div>
@@ -561,6 +659,124 @@ function PatientDashboard({ user, activeTab, onWalletConnect }) {
           <div className="page-header">
             <h1 className="page-title">Doctor Access Control</h1>
             <p className="page-subtitle">Search for doctors and grant or revoke access to your medical records.</p>
+          </div>
+
+          {/* ── Incoming Access Requests ── */}
+          <div className="card" style={{ marginBottom: 24 }}>
+            <div className="card-header">
+              <div className="icon-chip" style={{ background: "rgba(139,92,246,0.15)", color: "#8b5cf6" }}>
+                <Bell size={18} />
+              </div>
+              <div className="card-header-text">
+                <h2 className="card-title">
+                  Doctor Access Requests
+                  {pendingCount > 0 && (
+                    <span style={{
+                      marginLeft: 10, fontSize: 11, fontWeight: 700,
+                      padding: "2px 8px", borderRadius: 99,
+                      background: "rgba(239,68,68,0.15)", color: "#ef4444"
+                    }}>{pendingCount} Pending</span>
+                  )}
+                </h2>
+                <p className="card-subtitle">Doctors who requested access to your records. Grant or reject below.</p>
+              </div>
+              <button className="btn btn-outline btn-sm" onClick={fetchAccessRequests} disabled={requestsLoading} style={{ marginLeft: "auto" }}>
+                <RefreshCw size={13} style={{ marginRight: 4 }} />Refresh
+              </button>
+            </div>
+
+            {requestsLoading ? (
+              <div style={{ padding: "20px", textAlign: "center", color: "var(--text-muted)" }}>
+                <span className="spinner" style={{ width: 20, height: 20, margin: "0 auto 8px", display: "block" }} />Loading requests...
+              </div>
+            ) : accessRequests.length === 0 ? (
+              <div className="empty-state" style={{ padding: "24px 0" }}>
+                <div className="empty-state-icon"><Bell size={26} /></div>
+                <div className="empty-state-text">No access requests yet.</div>
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: "0 0 4px" }}>
+                {accessRequests.map(req => (
+                  <div key={req._id} style={{
+                    padding: "14px 16px",
+                    borderRadius: "var(--radius-md)",
+                    background: req.status === "pending" ? "rgba(139,92,246,0.07)" : "var(--bg-tertiary)",
+                    border: `1px solid ${req.status === "pending" ? "rgba(139,92,246,0.25)" : "var(--border-subtle)"}`,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 14,
+                  }}>
+                    {/* Doctor Avatar */}
+                    <div style={{
+                      width: 42, height: 42, borderRadius: "50%",
+                      background: "rgba(99,102,241,0.15)", color: "#6366f1",
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      fontWeight: 700, fontSize: 16, flexShrink: 0
+                    }}>
+                      {req.doctorName.charAt(0).toUpperCase()}
+                    </div>
+
+                    {/* Info */}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontWeight: 600, fontSize: 14, color: "var(--text-primary)" }}>
+                        Dr. {req.doctorName}
+                      </div>
+                      <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
+                        {req.doctorEmail} {req.doctorSpecialization && `· ${req.doctorSpecialization}`} {req.doctorHospital && `· ${req.doctorHospital}`}
+                      </div>
+                      <div style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 3 }}>
+                        Requesting: <strong>{req.requestType === "both" ? "View & Upload" : req.requestType === "view" ? "View Records" : "Upload Records"}</strong>
+                        {" · "}{new Date(req.createdAt).toLocaleDateString()}
+                      </div>
+                      {req.message && (
+                        <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 4, fontStyle: "italic" }}>
+                          "{req.message}"
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Status / Actions */}
+                    {req.status === "pending" ? (
+                      <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+                        <button
+                          className="btn btn-sm"
+                          style={{ background: "rgba(34,197,94,0.15)", color: "#22c55e", border: "1px solid rgba(34,197,94,0.3)" }}
+                          onClick={() => handleApproveRequest(req)}
+                          disabled={!!processingReq[req._id]}
+                        >
+                          {processingReq[req._id] === "approving" ? (
+                            <span className="spinner" style={{ width: 12, height: 12, borderWidth: 2 }} />
+                          ) : (
+                            <><CheckCircle size={13} style={{ marginRight: 4 }} />Grant</>
+                          )}
+                        </button>
+                        <button
+                          className="btn btn-sm"
+                          style={{ background: "rgba(239,68,68,0.1)", color: "#ef4444", border: "1px solid rgba(239,68,68,0.25)" }}
+                          onClick={() => handleRejectRequest(req)}
+                          disabled={!!processingReq[req._id]}
+                        >
+                          {processingReq[req._id] === "rejecting" ? (
+                            <span className="spinner" style={{ width: 12, height: 12, borderWidth: 2 }} />
+                          ) : (
+                            <><XCircle size={13} style={{ marginRight: 4 }} />Reject</>
+                          )}
+                        </button>
+                      </div>
+                    ) : (
+                      <span style={{
+                        fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: 99,
+                        background: req.status === "approved" ? "rgba(34,197,94,0.15)" : "rgba(239,68,68,0.12)",
+                        color: req.status === "approved" ? "#22c55e" : "#ef4444",
+                        flexShrink: 0
+                      }}>
+                        {req.status.toUpperCase()}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           {!account && (
@@ -745,6 +961,16 @@ function PatientDashboard({ user, activeTab, onWalletConnect }) {
             </div>
           )}
         </>
+      )}
+      {/* ── Record Viewer & Verification Modal ── */}
+      {selectedRecordForViewer && (
+        <RecordViewerModal
+          record={selectedRecordForViewer}
+          patientAddress={account}
+          contract={contract}
+          currentUserRole="patient"
+          onClose={() => setSelectedRecordForViewer(null)}
+        />
       )}
     </>
   );

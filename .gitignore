@@ -27,3 +27,6 @@ smart-contracts/cache/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Local Ganache database
+ganache_data/

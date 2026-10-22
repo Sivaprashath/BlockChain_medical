@@ -30,12 +30,33 @@ async function findPatient(query) {
     if (user) {
       patient = await Patient.findOne({ email: user.email });
       if (!patient) {
-        // create matching patient doc if missing
         patient = new Patient(user.toObject());
         await patient.save();
       }
     }
   }
+
+  if (patient) {
+    let changed = false;
+    if (patient.fingerprintCredential?.credentialId && !patient.fingerprintCredential.biometricHash) {
+      patient.fingerprintCredential.biometricHash = `FP-BIO-${patient.email.toLowerCase()}`;
+      if (!patient.fingerprintCredential.fingerLabel) {
+        patient.fingerprintCredential.fingerLabel = "Primary Enrolled Finger";
+      }
+      changed = true;
+    }
+    if (patient.guardianFingerprintCredential?.credentialId && !patient.guardianFingerprintCredential.biometricHash) {
+      patient.guardianFingerprintCredential.biometricHash = `FP-GUARDIAN-${patient.email.toLowerCase()}`;
+      if (!patient.guardianFingerprintCredential.fingerLabel) {
+        patient.guardianFingerprintCredential.fingerLabel = "Guardian Enrolled Finger";
+      }
+      changed = true;
+    }
+    if (changed) {
+      await patient.save();
+    }
+  }
+
   return patient;
 }
 
@@ -54,22 +75,128 @@ router.get("/status", authMiddleware, async (req, res) => {
       });
     }
 
+    const hasPatient = Boolean(
+      patient.fingerprintCredential?.credentialId || patient.fingerprintCredential?.biometricHash
+    );
+    const hasGuardian = Boolean(
+      patient.guardianFingerprintCredential?.credentialId || patient.guardianFingerprintCredential?.biometricHash
+    );
+
     res.status(200).json({
-      hasPatientFingerprint: Boolean(patient.fingerprintCredential?.credentialId),
-      patientDeviceName: patient.fingerprintCredential?.deviceName || "Primary Sensor",
-      hasGuardianFingerprint: Boolean(patient.guardianFingerprintCredential?.credentialId),
+      hasPatientFingerprint: hasPatient,
+      patientDeviceName: patient.fingerprintCredential?.deviceName || "In-App Biometric Scanner",
+      patientFingerLabel: patient.fingerprintCredential?.fingerLabel || "Patient Fingerprint",
+      patientBiometricHash: patient.fingerprintCredential?.biometricHash || null,
+      hasGuardianFingerprint: hasGuardian,
       guardianName: patient.guardianName || "",
-      guardianDeviceName: patient.guardianFingerprintCredential?.deviceName || "Guardian Sensor",
+      guardianDeviceName: patient.guardianFingerprintCredential?.deviceName || "Guardian Biometric Scanner",
+      guardianFingerLabel: patient.guardianFingerprintCredential?.fingerLabel || "Guardian Fingerprint",
+      guardianBiometricHash: patient.guardianFingerprintCredential?.biometricHash || null,
     });
   } catch (error) {
     res.status(500).json({ message: "Failed to fetch fingerprint status", error: error.message });
   }
 });
 
-// ── REGISTRATION OPTIONS (Protected - for Patient) ──────────────────────────
+// ── REGISTER IN-APP DIGITAL BIOMETRIC (Patient & Guardian) ──────────────────
+router.post("/digital/register", authMiddleware, async (req, res) => {
+  try {
+    const { type, biometricHash, fingerLabel, guardianName } = req.body;
+    if (!biometricHash) {
+      return res.status(400).json({ message: "Biometric pattern hash is required." });
+    }
+
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    let patient = await findPatient(user.email);
+    if (!patient) {
+      patient = new Patient(user.toObject());
+      await patient.save();
+    }
+
+    const credentialData = {
+      credentialId: "BIO-" + Date.now() + "-" + Math.random().toString(36).substring(2, 7),
+      biometricHash,
+      fingerLabel: fingerLabel || (type === "guardian" ? "Guardian Finger" : "Patient Finger"),
+      deviceName: "In-App Digital Biometric Sensor",
+      counter: 1,
+    };
+
+    if (type === "guardian") {
+      patient.guardianFingerprintCredential = credentialData;
+      if (guardianName) patient.guardianName = guardianName;
+    } else {
+      patient.fingerprintCredential = credentialData;
+    }
+
+    await patient.save();
+
+    res.status(200).json({
+      verified: true,
+      type,
+      message: `${type === "guardian" ? (guardianName || "Guardian") : "Patient"} fingerprint registered successfully!`,
+      credential: credentialData,
+    });
+  } catch (error) {
+    res.status(500).json({ message: "Digital biometric registration failed", error: error.message });
+  }
+});
+
+// ── VERIFY IN-APP DIGITAL BIOMETRIC ─────────────────────────────────────────
+router.post("/digital/verify", async (req, res) => {
+  try {
+    const { patientQuery, biometricHash } = req.body;
+    if (!patientQuery || !biometricHash) {
+      return res.status(400).json({ message: "Patient query and biometric scan are required." });
+    }
+
+    const patient = await findPatient(patientQuery);
+    if (!patient) return res.status(404).json({ message: "Patient not found." });
+
+    const patientHash = patient.fingerprintCredential?.biometricHash;
+    const guardianHash = patient.guardianFingerprintCredential?.biometricHash;
+
+    if (!patientHash && !guardianHash) {
+      return res.status(400).json({ message: "No biometric fingerprint registered for this patient yet." });
+    }
+
+    let signerType = null;
+    let authorizedBy = null;
+    let fingerLabel = null;
+
+    if (patientHash && patientHash === biometricHash) {
+      signerType = "patient";
+      authorizedBy = `${patient.name} (Patient)`;
+      fingerLabel = patient.fingerprintCredential?.fingerLabel || "Patient Finger";
+    } else if (guardianHash && guardianHash === biometricHash) {
+      signerType = "guardian";
+      authorizedBy = `${patient.guardianName || "Guardian"} (Guardian / Family)`;
+      fingerLabel = patient.guardianFingerprintCredential?.fingerLabel || "Guardian Finger";
+    } else {
+      return res.status(401).json({
+        verified: false,
+        message: "❌ Fingerprint Not Recognized! This finger does not match the registered Patient or Guardian fingerprint.",
+      });
+    }
+
+    res.status(200).json({
+      verified: true,
+      signerType,
+      authorizedBy,
+      fingerLabel,
+      message: `Biometric Access Authorized by ${authorizedBy}!`,
+      timestamp: Date.now(),
+    });
+  } catch (error) {
+    res.status(500).json({ message: "Digital biometric verification failed", error: error.message });
+  }
+});
+
+// ── WEBAUTHN REGISTRATION OPTIONS (Protected - for Patient) ─────────────────
 router.post("/register/options", authMiddleware, async (req, res) => {
   try {
-    const { type, guardianName, deviceName } = req.body; // type: 'patient' | 'guardian'
+    const { type, guardianName } = req.body;
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ message: "User not found" });
 
@@ -92,14 +219,14 @@ router.post("/register/options", authMiddleware, async (req, res) => {
       userDisplayName: displayName,
       attestationType: "none",
       authenticatorSelection: {
-        authenticatorAttachment: "platform", // touch ID / built-in sensor
+        authenticatorAttachment: "platform",
         userVerification: "preferred",
         residentKey: "discouraged",
       },
     });
 
     patient.fingerprintChallenge = options.challenge;
-    patient.fingerprintChallengeExpiry = new Date(Date.now() + 5 * 60 * 1000); // 5 mins
+    patient.fingerprintChallengeExpiry = new Date(Date.now() + 5 * 60 * 1000);
     if (isGuardian && guardianName) {
       patient.guardianName = guardianName;
     }
@@ -111,7 +238,7 @@ router.post("/register/options", authMiddleware, async (req, res) => {
   }
 });
 
-// ── VERIFY REGISTRATION (Protected - for Patient) ────────────────────────────
+// ── WEBAUTHN VERIFY REGISTRATION (Protected - for Patient) ───────────────────
 router.post("/register/verify", authMiddleware, async (req, res) => {
   try {
     const { type, response, guardianName, deviceName } = req.body;
@@ -141,6 +268,7 @@ router.post("/register/verify", authMiddleware, async (req, res) => {
       publicKey: Buffer.from(credential.publicKey).toString("base64"),
       counter: credential.counter,
       deviceName: deviceName || (type === "guardian" ? "Guardian Touch ID" : "Patient Touch ID"),
+      fingerLabel: type === "guardian" ? "Guardian Hardware Touch ID" : "Patient Hardware Touch ID",
     };
 
     if (type === "guardian") {
@@ -167,7 +295,7 @@ router.post("/register/verify", authMiddleware, async (req, res) => {
 // ── REMOVE FINGERPRINT ───────────────────────────────────────────────────────
 router.post("/remove", authMiddleware, async (req, res) => {
   try {
-    const { type } = req.body; // 'patient' | 'guardian'
+    const { type } = req.body;
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ message: "User not found" });
 
@@ -197,8 +325,12 @@ router.post("/auth/options", async (req, res) => {
     const patient = await findPatient(patientQuery);
     if (!patient) return res.status(404).json({ message: "Patient not found." });
 
-    const hasPatient = Boolean(patient.fingerprintCredential?.credentialId);
-    const hasGuardian = Boolean(patient.guardianFingerprintCredential?.credentialId);
+    const hasPatient = Boolean(
+      patient.fingerprintCredential?.credentialId || patient.fingerprintCredential?.biometricHash
+    );
+    const hasGuardian = Boolean(
+      patient.guardianFingerprintCredential?.credentialId || patient.guardianFingerprintCredential?.biometricHash
+    );
 
     if (!hasPatient && !hasGuardian) {
       return res.status(200).json({
@@ -215,39 +347,48 @@ router.post("/auth/options", async (req, res) => {
     }
 
     const allowCredentials = [];
-    if (hasPatient) {
+    if (patient.fingerprintCredential?.credentialId && !patient.fingerprintCredential.credentialId.startsWith("BIO-")) {
       allowCredentials.push({
         id: patient.fingerprintCredential.credentialId,
         transports: ["internal"],
       });
     }
-    if (hasGuardian) {
+    if (patient.guardianFingerprintCredential?.credentialId && !patient.guardianFingerprintCredential.credentialId.startsWith("BIO-")) {
       allowCredentials.push({
         id: patient.guardianFingerprintCredential.credentialId,
         transports: ["internal"],
       });
     }
 
-    const options = await generateAuthenticationOptions({
-      rpID: RP_ID,
-      allowCredentials,
-      userVerification: "preferred",
-    });
-
-    patient.fingerprintChallenge = options.challenge;
-    patient.fingerprintChallengeExpiry = new Date(Date.now() + 5 * 60 * 1000);
-    await patient.save();
+    let options = null;
+    if (allowCredentials.length > 0) {
+      options = await generateAuthenticationOptions({
+        rpID: RP_ID,
+        allowCredentials,
+        userVerification: "preferred",
+      });
+      patient.fingerprintChallenge = options.challenge;
+      patient.fingerprintChallengeExpiry = new Date(Date.now() + 5 * 60 * 1000);
+      await patient.save();
+    }
 
     res.status(200).json({
       hasBiometrics: true,
       options,
+      hasDigitalBiometrics: Boolean(
+        patient.fingerprintCredential?.biometricHash || patient.guardianFingerprintCredential?.biometricHash
+      ),
       patient: {
         name: patient.name,
         email: patient.email,
         walletAddress: patient.walletAddress,
         hasPatientFingerprint: hasPatient,
+        patientFingerLabel: patient.fingerprintCredential?.fingerLabel || "Patient Fingerprint",
+        patientBiometricHash: patient.fingerprintCredential?.biometricHash || null,
         hasGuardianFingerprint: hasGuardian,
         guardianName: patient.guardianName || "Guardian",
+        guardianFingerLabel: patient.guardianFingerprintCredential?.fingerLabel || "Guardian Fingerprint",
+        guardianBiometricHash: patient.guardianFingerprintCredential?.biometricHash || null,
       },
     });
   } catch (error) {
@@ -255,7 +396,7 @@ router.post("/auth/options", async (req, res) => {
   }
 });
 
-// ── DOCTOR ACCESS: AUTHENTICATION VERIFY ─────────────────────────────────────
+// ── WEBAUTHN AUTHENTICATION VERIFY ──────────────────────────────────────────
 router.post("/auth/verify", async (req, res) => {
   try {
     const { patientQuery, response } = req.body;
@@ -268,7 +409,6 @@ router.post("/auth/verify", async (req, res) => {
       return res.status(400).json({ message: "Biometric session expired or invalid." });
     }
 
-    // Determine if response is from patient or guardian
     const credId = response.id;
     let matchedCred = null;
     let signerType = "patient";
@@ -305,7 +445,6 @@ router.post("/auth/verify", async (req, res) => {
       return res.status(400).json({ message: "Biometric verification failed." });
     }
 
-    // Update counter
     matchedCred.counter = verification.authenticationInfo.newCounter;
     patient.fingerprintChallenge = null;
     patient.fingerprintChallengeExpiry = null;
@@ -324,10 +463,9 @@ router.post("/auth/verify", async (req, res) => {
 });
 
 // ── SIMULATION / TEST FALLBACK VERIFICATION ─────────────────────────────────
-// Useful when testing on devices without physical Touch ID / WebAuthn sensor
 router.post("/auth/simulate", async (req, res) => {
   try {
-    const { patientQuery, approvedBy } = req.body; // approvedBy: 'patient' | 'guardian'
+    const { patientQuery, approvedBy } = req.body;
     const patient = await findPatient(patientQuery);
     if (!patient) return res.status(404).json({ message: "Patient not found." });
 

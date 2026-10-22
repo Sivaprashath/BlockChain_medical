@@ -4,6 +4,7 @@ pragma solidity ^0.8.19;
 contract MedicalRecord {
 
     struct Record {
+        string ipfsCID;
         string fileHash;
         string recordType;
         string description;
@@ -17,23 +18,77 @@ contract MedicalRecord {
     mapping(address => address[]) private grantedDoctorsList;
     mapping(address => address[]) private uploadPermittedDoctorsList;
 
-    event RecordUploaded(address indexed patient, address indexed uploadedBy, string fileHash, string recordType, uint256 timestamp);
+    event RecordUploaded(
+        address indexed patient,
+        address indexed uploadedBy,
+        string ipfsCID,
+        string fileHash,
+        string recordType,
+        uint256 timestamp
+    );
     event AccessGranted(address indexed patient, address indexed doctor);
     event AccessRevoked(address indexed patient, address indexed doctor);
     event UploadPermissionGranted(address indexed patient, address indexed doctor);
     event UploadPermissionRevoked(address indexed patient, address indexed doctor);
+    event IntegrityVerified(
+        address indexed patient,
+        address indexed verifier,
+        string ipfsCID,
+        string fileHash,
+        bool isValid,
+        uint256 timestamp
+    );
 
-    // Patient uploads their own record
-    function uploadRecord(string memory _fileHash, string memory _recordType, string memory _description) public {
-        patientRecords[msg.sender].push(Record(_fileHash, _recordType, _description, block.timestamp, msg.sender));
-        emit RecordUploaded(msg.sender, msg.sender, _fileHash, _recordType, block.timestamp);
+    // Patient uploads their own encrypted record with SHA-256 integrity hash
+    function uploadRecord(
+        string memory _ipfsCID,
+        string memory _fileHash,
+        string memory _recordType,
+        string memory _description
+    ) public {
+        patientRecords[msg.sender].push(Record(
+            _ipfsCID,
+            _fileHash,
+            _recordType,
+            _description,
+            block.timestamp,
+            msg.sender
+        ));
+        emit RecordUploaded(msg.sender, msg.sender, _ipfsCID, _fileHash, _recordType, block.timestamp);
     }
 
     // Doctor uploads record on behalf of patient (requires upload permission)
-    function doctorUploadRecord(address _patient, string memory _fileHash, string memory _recordType, string memory _description) public {
+    function doctorUploadRecord(
+        address _patient,
+        string memory _ipfsCID,
+        string memory _fileHash,
+        string memory _recordType,
+        string memory _description
+    ) public {
         require(uploadPermission[_patient][msg.sender], "Upload permission not granted by patient");
-        patientRecords[_patient].push(Record(_fileHash, _recordType, _description, block.timestamp, msg.sender));
-        emit RecordUploaded(_patient, msg.sender, _fileHash, _recordType, block.timestamp);
+        patientRecords[_patient].push(Record(
+            _ipfsCID,
+            _fileHash,
+            _recordType,
+            _description,
+            block.timestamp,
+            msg.sender
+        ));
+        emit RecordUploaded(_patient, msg.sender, _ipfsCID, _fileHash, _recordType, block.timestamp);
+    }
+
+    // Log integrity verification outcome on-chain (Table IV in research paper)
+    function logIntegrityVerification(
+        address _patient,
+        string memory _ipfsCID,
+        string memory _fileHash,
+        bool _isValid
+    ) public {
+        require(
+            msg.sender == _patient || accessPermission[_patient][msg.sender],
+            "Access denied: you do not have permission to verify records for this patient"
+        );
+        emit IntegrityVerified(_patient, msg.sender, _ipfsCID, _fileHash, _isValid, block.timestamp);
     }
 
     // Grant view access to doctor

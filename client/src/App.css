@@ -1056,3 +1056,98 @@ select.input option { background: #ffffff; color: var(--ink-1); }
   gap: 12px;
   margin-bottom: 10px;
 }
+
+/* ═══════════════════════════════════════════════════════════
+   IN-APP DIGITAL BIOMETRIC SCANNER STYLES
+═══════════════════════════════════════════════════════════ */
+.biometric-pad-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 20px 16px;
+  background: radial-gradient(circle at 50% 50%, rgba(99, 102, 241, 0.08) 0%, rgba(243, 244, 246, 0.6) 100%);
+  border: 1.5px dashed rgba(99, 102, 241, 0.25);
+  border-radius: var(--radius-lg);
+  position: relative;
+  overflow: hidden;
+  margin: 16px 0;
+  user-select: none;
+}
+
+.biometric-touch-target {
+  width: 120px;
+  height: 140px;
+  border-radius: 60px 60px 50px 50px;
+  background: linear-gradient(180deg, #ffffff 0%, #f3f4f6 100%);
+  border: 2px solid rgba(99, 102, 241, 0.35);
+  box-shadow: 0 8px 24px rgba(99, 102, 241, 0.12), inset 0 2px 8px rgba(255, 255, 255, 0.8);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.biometric-touch-target:hover {
+  border-color: var(--teal);
+  transform: translateY(-2px);
+  box-shadow: 0 12px 30px rgba(99, 102, 241, 0.22);
+}
+
+.biometric-touch-target.active-scan {
+  transform: scale(0.96);
+  border-color: #10b981;
+  box-shadow: 0 0 0 6px rgba(16, 185, 129, 0.2), inset 0 0 15px rgba(16, 185, 129, 0.2);
+}
+
+.scanner-laser-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, transparent, #10b981, #06b6d4, #10b981, transparent);
+  box-shadow: 0 0 12px 3px rgba(16, 185, 129, 0.8);
+  pointer-events: none;
+  animation: laserScan 1.2s ease-in-out infinite alternate;
+}
+
+@keyframes laserScan {
+  0% { top: 10%; }
+  100% { top: 90%; }
+}
+
+.scanner-finger-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 14px;
+}
+
+.scanner-finger-btn {
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: 20px;
+  border: 1px solid var(--glass-border);
+  background: #ffffff;
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.scanner-finger-btn:hover {
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+.scanner-finger-btn.selected {
+  background: var(--teal);
+  color: #ffffff;
+  border-color: var(--teal);
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.3);
+}

@@ -3,8 +3,10 @@ const mongoose = require('mongoose');
 const fingerprintCredentialSchema = new mongoose.Schema({
   credentialId: { type: String },
   publicKey: { type: String },
+  biometricHash: { type: String },
+  fingerLabel: { type: String, default: 'Fingerprint' },
   counter: { type: Number, default: 0 },
-  deviceName: { type: String, default: 'Primary Device' }
+  deviceName: { type: String, default: 'Biometric Scanner' }
 }, { _id: false });
 
 const patientSchema = new mongoose.Schema({

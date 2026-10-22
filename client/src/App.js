@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import {
   ShieldCheck, LogOut, LayoutDashboard, FileText, Users,
-  User, ChevronRight, ClipboardList, Fingerprint, UploadCloud
+  User, ChevronRight, ClipboardList, Fingerprint, UploadCloud, Send
 } from "lucide-react";
 import Login from "./Login";
 import PatientDashboard from "./PatientDashboard";
@@ -37,6 +37,7 @@ const NAV_ITEMS = {
     { id: "dashboard",  label: "Dashboard",          icon: LayoutDashboard },
     { id: "records",    label: "Patient Records",    icon: FileText },
     { id: "upload",     label: "Upload for Patient", icon: UploadCloud },
+    { id: "request",    label: "Request Access",      icon: Send },
     { id: "audit",      label: "Audit Log",          icon: ClipboardList },
     { id: "profile",    label: "My Profile",         icon: User },
   ],
@@ -55,6 +56,7 @@ const PAGE_TITLES = {
   biometrics: "Fingerprint & Guardian Access",
   upload:     "Upload for Patient",
   doctors:    "Our Doctors",
+  request:    "Request Patient Access",
   audit:      "Audit Log",
   profile:    "My Profile",
 };
@@ -201,7 +203,7 @@ function App() {
           {/* ── Dashboard content ── */}
           <main className="page-content">
 
-            {/* Profile page — all roles */}
+                        {/* Profile page — all roles */}
             {activeNav === "profile" && (
               <ProfilePage
                 user={user}
@@ -213,6 +215,15 @@ function App() {
             {activeNav === "audit" && (
               <AuditLog
                 user={user}
+                onWalletConnect={setWalletAddress}
+              />
+            )}
+
+            {/* Request Access — Doctor role */}
+            {activeNav === "request" && user.role === "doctor" && (
+              <DoctorDashboard
+                user={user}
+                activeTab="request"
                 onWalletConnect={setWalletAddress}
               />
             )}
@@ -232,7 +243,7 @@ function App() {
                 onWalletConnect={setWalletAddress}
               />
             )}
-            {activeNav !== "profile" && activeNav !== "audit" && user.role === "doctor" && (
+            {activeNav !== "profile" && activeNav !== "audit" && activeNav !== "request" && user.role === "doctor" && (
               <DoctorDashboard
                 user={user}
                 activeTab={activeNav}

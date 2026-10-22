@@ -65,6 +65,13 @@ const EVENT_CONFIG = {
     bg: "rgba(239,68,68,0.08)",
     border: "rgba(239,68,68,0.25)",
   },
+  IntegrityVerified: {
+    label: "Integrity Verified",
+    icon: ShieldCheck,
+    color: "#059669",
+    bg: "rgba(5, 150, 105, 0.1)",
+    border: "rgba(5, 150, 105, 0.25)",
+  },
 };
 
 function AuditLog({ user, onWalletConnect }) {
@@ -107,10 +114,13 @@ function AuditLog({ user, onWalletConnect }) {
     setEvents([]);
     try {
       const contract = new ethers.Contract(CONTRACT_ADDRESS, MedicalRecordArtifact.abi, provider);
-      const [uploadedRaw, grantedRaw, revokedRaw] = await Promise.all([
+      const [uploadedRaw, grantedRaw, revokedRaw, verifiedRaw] = await Promise.all([
         contract.queryFilter(contract.filters.RecordUploaded(), 0, "latest"),
         contract.queryFilter(contract.filters.AccessGranted(), 0, "latest"),
         contract.queryFilter(contract.filters.AccessRevoked(), 0, "latest"),
+        contract.filters.IntegrityVerified
+          ? contract.queryFilter(contract.filters.IntegrityVerified(), 0, "latest").catch(() => [])
+          : Promise.resolve([]),
       ]);
 
       const uploaded = uploadedRaw.map(e => ({
@@ -170,6 +180,7 @@ function AuditLog({ user, onWalletConnect }) {
     RecordUploaded: events.filter(e => e.type === "RecordUploaded").length,
     AccessGranted:  events.filter(e => e.type === "AccessGranted").length,
     AccessRevoked:  events.filter(e => e.type === "AccessRevoked").length,
+    IntegrityVerified: events.filter(e => e.type === "IntegrityVerified").length,
   };
 
   return (
@@ -234,14 +245,14 @@ function AuditLog({ user, onWalletConnect }) {
             <div className="card-header-action" style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
               <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
                 <Filter size={13} style={{ color: "var(--ink-4)" }} />
-                {["All", "RecordUploaded", "AccessGranted", "AccessRevoked"].map(f => (
+                {["All", "RecordUploaded", "AccessGranted", "AccessRevoked", "IntegrityVerified"].map(f => (
                   <button
                     key={f}
                     className={`btn btn-sm ${filter === f ? "btn-primary" : "btn-outline"}`}
                     style={{ fontSize: 11, padding: "4px 10px" }}
                     onClick={() => setFilter(f)}
                   >
-                    {f === "All" ? "All" : f === "RecordUploaded" ? "Uploads" : f === "AccessGranted" ? "Granted" : "Revoked"}
+                    {f === "All" ? "All" : f === "RecordUploaded" ? "Uploads" : f === "AccessGranted" ? "Granted" : f === "AccessRevoked" ? "Revoked" : "Integrity"}
                     <span style={{ marginLeft: 4, opacity: 0.7 }}>({counts[f]})</span>
                   </button>
                 ))}

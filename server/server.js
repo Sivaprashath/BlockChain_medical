@@ -13,6 +13,7 @@ if (!process.env.JWT_SECRET)  throw new Error("❌ JWT_SECRET is not set in .env
 
 const authRoutes = require("./routes/auth");
 const fingerprintRoutes = require("./routes/fingerprint");
+const accessRequestRoutes = require("./routes/accessRequests");
 
 const app = express();
 
@@ -42,6 +43,7 @@ mongoose
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/api/auth", authRoutes);
 app.use("/api/fingerprint", fingerprintRoutes);
+app.use("/api/access-requests", accessRequestRoutes);
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {

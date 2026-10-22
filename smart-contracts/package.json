@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "ganache": "ganache --port 8545 --chain.chainId 1337 --database.dbPath ../ganache_data --wallet.mnemonic \\\"candy maple cake sugar pudding cream honey rich smooth crumble sweet treat\\\""
   },
   "keywords": [],
   "author": "",

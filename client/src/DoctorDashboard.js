@@ -7,12 +7,15 @@ import {
   Copy, CheckCircle2, X, AlertCircle,
   FlaskConical, Pill, ScanLine, FileQuestion,
   User, Mail, MapPin, Check, Fingerprint,
-  HeartHandshake, UploadCloud, ShieldCheck
+  HeartHandshake, UploadCloud, ShieldCheck, Send, RefreshCw
 } from "lucide-react";
 import MedicalRecordArtifact from "./MedicalRecord.json";
+import { encryptMedicalFile } from "./utils/cryptoUtils";
+import RecordViewerModal from "./RecordViewerModal";
 
 const CONTRACT_ADDRESS = process.env.REACT_APP_CONTRACT_ADDRESS || "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 const AUTH_API = process.env.REACT_APP_API_URL || "http://localhost:5001/api/auth";
+const ACCESS_REQ_API = process.env.REACT_APP_API_URL?.replace("/api/auth", "/api/access-requests") || "http://localhost:5001/api/access-requests";
 const FINGERPRINT_API = process.env.REACT_APP_API_URL?.replace("/api/auth", "/api/fingerprint") || "http://localhost:5001/api/fingerprint";
 const PINATA_JWT = process.env.REACT_APP_PINATA_JWT;
 
@@ -103,7 +106,16 @@ function DoctorDashboard({ user, onWalletConnect, activeTab = "dashboard" }) {
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [dragging, setDragging] = useState(false);
+  const [selectedRecordForViewer, setSelectedRecordForViewer] = useState(null);
   const uploadFileInputRef = useRef();
+
+  // Access Request State
+  const [reqPatientEmail, setReqPatientEmail] = useState("");
+  const [reqType, setReqType] = useState("view");
+  const [reqMessage, setReqMessage] = useState("");
+  const [reqSending, setReqSending] = useState(false);
+  const [sentRequests, setSentRequests] = useState([]);
+  const [sentRequestsLoading, setSentRequestsLoading] = useState(false);
 
   // Auto-connect if already authorized
   useEffect(() => {
@@ -238,6 +250,8 @@ function DoctorDashboard({ user, onWalletConnect, activeTab = "dashboard" }) {
     }
   };
 
+
+
   // Perform Touch ID / WebAuthn scan
   const handleScanBiometrics = async () => {
     if (!bioData?.options) return;
@@ -331,7 +345,8 @@ function DoctorDashboard({ user, onWalletConnect, activeTab = "dashboard" }) {
       }
 
       // Check on-chain upload permission
-      const hasPerm = await contract.hasUploadPermission(targetAddress, account);
+      const doctorWallet = user?.walletAddress || account;
+      const hasPerm = await contract.hasUploadPermission(targetAddress, doctorWallet);
       setHasUploadPerm(Boolean(hasPerm));
 
       if (hasPerm) {
@@ -350,32 +365,44 @@ function DoctorDashboard({ user, onWalletConnect, activeTab = "dashboard" }) {
     if (!contract || !uploadFile || !uploadPatientInfo?.walletAddress) {
       toast("Please choose a file and confirm patient upload permission.", "error"); return;
     }
+    if (user?.walletAddress && account && account.toLowerCase() !== user.walletAddress.toLowerCase()) {
+      toast("Please switch MetaMask to your Doctor Account (" + shortenAddress(user.walletAddress) + ") to sign the transaction.", "error", "MetaMask Account Mismatch");
+      return;
+    }
     try {
       setIsUploading(true);
       setUploadProgress(20);
 
-      // 1. Pin file to Pinata IPFS
-      const formData = new FormData();
-      formData.append("file", uploadFile);
+      // 1. Client-side AES-256 Encryption & SHA-256 Fingerprint: H = SHA256(Fenc)
+      toast("Encrypting medical file with AES-256-GCM before upload…", "info", "Security Layer");
+      const encResult = await encryptMedicalFile(uploadFile, uploadPatientInfo.walletAddress);
+      const encryptedFile = encResult.encryptedFile;
+      const fileHash = encResult.fileHash;
 
-      toast("Uploading file to IPFS…", "warning", "IPFS Storage");
+      setUploadProgress(35);
+      toast("Uploading encrypted payload (Fenc) to IPFS…", "warning", "Off-Chain IPFS");
+
+      // 2. Upload Encrypted File to Pinata IPFS
+      const formData = new FormData();
+      formData.append("file", encryptedFile);
       const pinRes = await axios.post(
         "https://api.pinata.cloud/pinning/pinFileToIPFS",
         formData,
         {
           headers: { "Content-Type": "multipart/form-data", Authorization: `Bearer ${PINATA_JWT}` },
-          onUploadProgress: p => setUploadProgress(Math.round(20 + (p.loaded / p.total) * 50)),
+          onUploadProgress: p => setUploadProgress(Math.round(35 + (p.loaded / p.total) * 40)),
         }
       );
 
-      const ipfsHash = pinRes.data.IpfsHash;
+      const ipfsCID = pinRes.data.IpfsHash;
       setUploadProgress(75);
-      toast("Writing record to blockchain for patient… Confirm MetaMask signature", "warning", "Contract Call");
+      toast("Writing CID & SHA-256 hash to blockchain… Confirm MetaMask signature", "warning", "Contract Call");
 
-      // 2. Call doctorUploadRecord on the smart contract
+      // 3. Call doctorUploadRecord on smart contract with CID & SHA-256
       const tx = await contract.doctorUploadRecord(
         uploadPatientInfo.walletAddress,
-        ipfsHash,
+        ipfsCID,
+        fileHash,
         uploadRecordType,
         uploadDescription || `Uploaded by Dr. ${user.name}`
       );
@@ -405,6 +432,49 @@ function DoctorDashboard({ user, onWalletConnect, activeTab = "dashboard" }) {
   const onDragOver = e => { e.preventDefault(); setDragging(true); };
   const onDragLeave = () => setDragging(false);
 
+  // Fetch sent requests
+  const fetchSentRequests = useCallback(async () => {
+    setSentRequestsLoading(true);
+    try {
+      const token = localStorage.getItem("token");
+      const res = await axios.get(
+        `${ACCESS_REQ_API}/sent`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setSentRequests(res.data);
+    } catch (e) {
+      console.error("Failed to fetch sent requests", e);
+    } finally {
+      setSentRequestsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === "request") fetchSentRequests();
+  }, [activeTab, fetchSentRequests]);
+
+  // Send access request to patient
+  const sendAccessRequest = async () => {
+    if (!reqPatientEmail.trim()) { toast("Enter the patient's email address.", "error"); return; }
+    setReqSending(true);
+    try {
+      const token = localStorage.getItem("token");
+      await axios.post(
+        `${ACCESS_REQ_API}/send`,
+        { patientEmail: reqPatientEmail.trim(), requestType: reqType, message: reqMessage },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      toast("Access request sent to patient!", "success", "Request Sent");
+      setReqPatientEmail("");
+      setReqMessage("");
+      fetchSentRequests();
+    } catch (e) {
+      toast(e?.response?.data?.message || "Failed to send request.", "error");
+    } finally {
+      setReqSending(false);
+    }
+  };
+
   const copyToClipboard = (text) => {
     navigator.clipboard.writeText(text);
     toast("Copied!", "success");
@@ -413,10 +483,33 @@ function DoctorDashboard({ user, onWalletConnect, activeTab = "dashboard" }) {
   const showDashboard = activeTab === "dashboard";
   const showRecords   = activeTab === "records";
   const showUpload    = activeTab === "upload";
+  const showRequest   = activeTab === "request";
 
   return (
     <>
       <ToastContainer toasts={toasts} remove={removeToast} />
+
+      {/* MetaMask Account Mismatch Warning */}
+      {account && user?.walletAddress && account.toLowerCase() !== user.walletAddress.toLowerCase() && (
+        <div style={{
+          margin: "0 0 20px 0",
+          padding: "12px 18px",
+          borderRadius: "var(--radius-md)",
+          background: "rgba(245, 158, 11, 0.12)",
+          border: "1px solid rgba(245, 158, 11, 0.35)",
+          color: "#b45309",
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          fontSize: 13
+        }}>
+          <AlertCircle size={20} color="#b45309" style={{ flexShrink: 0 }} />
+          <div>
+            <strong>MetaMask Account Mismatch:</strong> You are logged in as Doctor <strong>Dr. {user.name}</strong> (<code>{shortenAddress(user.walletAddress)}</code>), but MetaMask is currently active on Account <code>{shortenAddress(account)}</code> (Patient).
+            <div style={{ marginTop: 2 }}>Please open MetaMask and switch to your Doctor account <code>{shortenAddress(user.walletAddress)}</code>.</div>
+          </div>
+        </div>
+      )}
 
       {/* ── BIOMETRIC SCANNER MODAL ── */}
       {bioModalOpen && bioData && (
@@ -436,20 +529,22 @@ function DoctorDashboard({ user, onWalletConnect, activeTab = "dashboard" }) {
               </button>
             </div>
 
-            <div style={{ padding: "24px" }}>
-              <div className={`biometric-scanner-ring ${bioScanning ? "scanning" : ""}`}>
-                <Fingerprint size={42} />
-              </div>
-
-              <div style={{ textAlign: "center", marginBottom: 20 }}>
+            <div style={{ padding: "20px 24px" }}>
+              <div style={{ textAlign: "center", marginBottom: 14 }}>
                 <h4 style={{ fontSize: 16, fontWeight: 600, color: "var(--ink-1)", marginBottom: 4 }}>
                   Biometric Consent Required
                 </h4>
                 <p style={{ fontSize: 13, color: "var(--ink-3)", lineHeight: 1.5 }}>
                   To access <strong>{bioData.patient.name}</strong>'s medical records, the patient or their registered
-                  guardian must authorize via fingerprint scanner.
+                  guardian must place their enrolled finger on the sensor below.
                 </p>
               </div>
+
+              
+              <div className={`biometric-scanner-ring ${bioScanning ? "scanning" : ""}`}>
+                <Fingerprint size={42} />
+              </div>
+  
 
               <div style={{ background: "var(--bg-base)", padding: "14px 16px", borderRadius: "var(--radius-sm)", marginBottom: 20 }}>
                 <div style={{ fontSize: 11, fontWeight: 600, color: "var(--ink-3)", textTransform: "uppercase", marginBottom: 8 }}>
@@ -754,10 +849,13 @@ function DoctorDashboard({ user, onWalletConnect, activeTab = "dashboard" }) {
                           </div>
                         </div>
                         <div className="record-actions">
-                          <a className="btn btn-outline btn-sm" href={link} target="_blank" rel="noreferrer">
-                            <ExternalLink size={13} /> View File
+                          <button className="btn btn-primary btn-sm" onClick={() => setSelectedRecordForViewer(r)} style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                            <ShieldCheck size={14} /> Verify & Decrypt
+                          </button>
+                          <a className="btn btn-ghost btn-icon" href={"https://gateway.pinata.cloud/ipfs/" + (r.ipfsCID || r[0] || r.fileHash)} target="_blank" rel="noreferrer" title="View Encrypted IPFS Payload">
+                            <ExternalLink size={13} />
                           </a>
-                          <button className="btn btn-ghost btn-icon" onClick={() => copyToClipboard(r.fileHash)}>
+                          <button className="btn btn-ghost btn-icon" onClick={() => copyToClipboard(r.fileHash || r[1] || r.ipfsCID)} title="Copy hash">
                             <Copy size={14} />
                           </button>
                         </div>
@@ -849,6 +947,27 @@ function DoctorDashboard({ user, onWalletConnect, activeTab = "dashboard" }) {
                 </div>
               )}
 
+              {/* Notice to switch MetaMask if still on Patient Account */}
+              {hasUploadPerm && account && user?.walletAddress && account.toLowerCase() !== user.walletAddress.toLowerCase() && (
+                <div style={{
+                  marginTop: 12,
+                  padding: "10px 14px",
+                  borderRadius: "var(--radius-sm)",
+                  background: "rgba(245, 158, 11, 0.1)",
+                  border: "1px solid rgba(245, 158, 11, 0.3)",
+                  color: "#b45309",
+                  fontSize: 13,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10
+                }}>
+                  <AlertCircle size={18} color="#b45309" style={{ flexShrink: 0 }} />
+                  <div>
+                    <strong>Action Required:</strong> In MetaMask, switch to your Doctor account (<code>{shortenAddress(user.walletAddress)}</code>) to sign and submit the upload transaction.
+                  </div>
+                </div>
+              )}
+
               {/* Upload Form - Enabled only when permission is confirmed */}
               {hasUploadPerm && (
                 <div style={{ marginTop: 24, borderTop: "1px solid var(--glass-border)", paddingTop: 20 }}>
@@ -926,6 +1045,376 @@ function DoctorDashboard({ user, onWalletConnect, activeTab = "dashboard" }) {
             </div>
           )}
         </>
+      )}
+      {/* ── Request Access Tab ── */}
+      {showRequest && (
+        <div className="page-section">
+          {/* ── Hero Header ── */}
+          <div style={{
+            background: "linear-gradient(135deg, rgba(99,102,241,0.12) 0%, rgba(139,92,246,0.08) 100%)",
+            border: "1px solid rgba(99,102,241,0.2)",
+            borderRadius: "var(--radius-xl, 16px)",
+            padding: "28px 32px",
+            marginBottom: 28,
+            display: "flex",
+            alignItems: "center",
+            gap: 20,
+          }}>
+            <div style={{
+              width: 56, height: 56, borderRadius: 16,
+              background: "linear-gradient(135deg, #6366f1, #8b5cf6)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              boxShadow: "0 8px 24px rgba(99,102,241,0.35)",
+              flexShrink: 0,
+            }}>
+              <Send size={24} color="#fff" />
+            </div>
+            <div>
+              <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: "var(--text-primary)" }}>
+                Request Patient Access
+              </h1>
+              <p style={{ margin: "4px 0 0", fontSize: 13, color: "var(--text-muted)", lineHeight: 1.5 }}>
+                Send an access request to a patient by their email. They will review and grant or reject it from their dashboard.
+              </p>
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "480px 1fr", gap: 24 }}>
+
+            {/* ── Left: Send Request Form ── */}
+            <div style={{
+              background: "var(--bg-card, var(--bg-secondary))",
+              border: "1px solid var(--border-subtle)",
+              borderRadius: "var(--radius-xl, 16px)",
+              overflow: "hidden",
+            }}>
+              {/* Card Header */}
+              <div style={{
+                padding: "20px 24px 16px",
+                borderBottom: "1px solid var(--border-subtle)",
+                background: "rgba(99,102,241,0.05)",
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <div style={{
+                    width: 32, height: 32, borderRadius: 8,
+                    background: "rgba(99,102,241,0.15)",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                  }}>
+                    <Mail size={15} color="#6366f1" />
+                  </div>
+                  <div>
+                    <div style={{ fontWeight: 700, fontSize: 15, color: "var(--text-primary)" }}>New Access Request</div>
+                    <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 1 }}>Fill in the details below</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Form Body */}
+              <div style={{ padding: "22px 24px 24px" }}>
+
+                {/* Email Field */}
+                <div style={{ marginBottom: 18 }}>
+                  <label style={{
+                    display: "block", fontSize: 12, fontWeight: 600,
+                    color: "var(--text-secondary)", marginBottom: 7, letterSpacing: "0.03em",
+                    textTransform: "uppercase",
+                  }}>
+                    Patient Email Address <span style={{ color: "#ef4444" }}>*</span>
+                  </label>
+                  <div style={{ position: "relative" }}>
+                    <div style={{
+                      position: "absolute", left: 13, top: "50%", transform: "translateY(-50%)",
+                      color: "var(--text-muted)", display: "flex", alignItems: "center",
+                    }}>
+                      <Mail size={15} />
+                    </div>
+                    <input
+                      type="email"
+                      placeholder="patient@example.com"
+                      value={reqPatientEmail}
+                      onChange={e => setReqPatientEmail(e.target.value)}
+                      onKeyDown={e => e.key === "Enter" && sendAccessRequest()}
+                      style={{
+                        width: "100%", boxSizing: "border-box",
+                        padding: "11px 14px 11px 38px",
+                        background: "var(--bg-tertiary, rgba(255,255,255,0.05))",
+                        border: "1px solid var(--border-subtle)",
+                        borderRadius: "var(--radius-md, 10px)",
+                        color: "var(--text-primary)",
+                        fontSize: 14,
+                        outline: "none",
+                        transition: "border-color 0.2s",
+                      }}
+                      onFocus={e => e.target.style.borderColor = "#6366f1"}
+                      onBlur={e => e.target.style.borderColor = "var(--border-subtle)"}
+                    />
+                  </div>
+                </div>
+
+                {/* Access Type - Card Selector */}
+                <div style={{ marginBottom: 18 }}>
+                  <label style={{
+                    display: "block", fontSize: 12, fontWeight: 600,
+                    color: "var(--text-secondary)", marginBottom: 8, letterSpacing: "0.03em",
+                    textTransform: "uppercase",
+                  }}>
+                    Access Type
+                  </label>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                    {[
+                      { value: "view",   label: "View Only",      icon: "👁️",  desc: "Read records" },
+                      { value: "upload", label: "Upload Only",    icon: "📤",  desc: "Add records" },
+                      { value: "both",   label: "Full Access",    icon: "✅",  desc: "View & upload" },
+                    ].map(opt => (
+                      <button
+                        key={opt.value}
+                        onClick={() => setReqType(opt.value)}
+                        style={{
+                          padding: "12px 8px",
+                          borderRadius: "var(--radius-md, 10px)",
+                          border: reqType === opt.value ? "2px solid #6366f1" : "1px solid var(--border-subtle)",
+                          background: reqType === opt.value ? "rgba(99,102,241,0.12)" : "var(--bg-tertiary)",
+                          cursor: "pointer",
+                          textAlign: "center",
+                          transition: "all 0.15s",
+                          transform: reqType === opt.value ? "scale(1.02)" : "scale(1)",
+                        }}
+                      >
+                        <div style={{ fontSize: 20, marginBottom: 4 }}>{opt.icon}</div>
+                        <div style={{ fontSize: 12, fontWeight: 700, color: reqType === opt.value ? "#6366f1" : "var(--text-primary)" }}>
+                          {opt.label}
+                        </div>
+                        <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 2 }}>{opt.desc}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Message */}
+                <div style={{ marginBottom: 22 }}>
+                  <label style={{
+                    display: "block", fontSize: 12, fontWeight: 600,
+                    color: "var(--text-secondary)", marginBottom: 7, letterSpacing: "0.03em",
+                    textTransform: "uppercase",
+                  }}>
+                    Message <span style={{ fontWeight: 400, color: "var(--text-muted)", textTransform: "none" }}>(optional)</span>
+                  </label>
+                  <textarea
+                    rows={3}
+                    placeholder="e.g. I need to review your recent lab results for your upcoming appointment..."
+                    value={reqMessage}
+                    onChange={e => setReqMessage(e.target.value)}
+                    style={{
+                      width: "100%", boxSizing: "border-box",
+                      padding: "11px 14px",
+                      background: "var(--bg-tertiary, rgba(255,255,255,0.05))",
+                      border: "1px solid var(--border-subtle)",
+                      borderRadius: "var(--radius-md, 10px)",
+                      color: "var(--text-primary)",
+                      fontSize: 14,
+                      outline: "none",
+                      resize: "vertical",
+                      lineHeight: 1.5,
+                      fontFamily: "inherit",
+                      transition: "border-color 0.2s",
+                    }}
+                    onFocus={e => e.target.style.borderColor = "#6366f1"}
+                    onBlur={e => e.target.style.borderColor = "var(--border-subtle)"}
+                  />
+                </div>
+
+                {/* Send Button */}
+                <button
+                  onClick={sendAccessRequest}
+                  disabled={reqSending || !reqPatientEmail.trim()}
+                  style={{
+                    width: "100%",
+                    padding: "13px",
+                    borderRadius: "var(--radius-md, 10px)",
+                    border: "none",
+                    background: reqSending || !reqPatientEmail.trim()
+                      ? "rgba(99,102,241,0.3)"
+                      : "linear-gradient(135deg, #6366f1, #8b5cf6)",
+                    color: "#fff",
+                    fontSize: 14,
+                    fontWeight: 700,
+                    cursor: reqSending || !reqPatientEmail.trim() ? "not-allowed" : "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: 8,
+                    boxShadow: reqSending || !reqPatientEmail.trim() ? "none" : "0 4px 16px rgba(99,102,241,0.4)",
+                    transition: "all 0.2s",
+                    letterSpacing: "0.02em",
+                  }}
+                >
+                  {reqSending ? (
+                    <><span className="spinner" style={{ width: 15, height: 15, borderWidth: 2, borderColor: "rgba(255,255,255,0.3)", borderTopColor: "#fff" }} />Sending Request...</>
+                  ) : (
+                    <><Send size={15} />Send Access Request</>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {/* ── Right: Sent Requests List ── */}
+            <div style={{
+              background: "var(--bg-card, var(--bg-secondary))",
+              border: "1px solid var(--border-subtle)",
+              borderRadius: "var(--radius-xl, 16px)",
+              overflow: "hidden",
+              display: "flex",
+              flexDirection: "column",
+            }}>
+              {/* Header */}
+              <div style={{
+                padding: "20px 24px 16px",
+                borderBottom: "1px solid var(--border-subtle)",
+                background: "rgba(99,102,241,0.05)",
+                display: "flex", alignItems: "center", justifyContent: "space-between",
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <div style={{
+                    width: 32, height: 32, borderRadius: 8,
+                    background: "rgba(99,102,241,0.15)",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                  }}>
+                    <RefreshCw size={15} color="#6366f1" />
+                  </div>
+                  <div>
+                    <div style={{ fontWeight: 700, fontSize: 15, color: "var(--text-primary)" }}>My Sent Requests</div>
+                    <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 1 }}>
+                      {sentRequests.length} total · {sentRequests.filter(r => r.status === "pending").length} pending
+                    </div>
+                  </div>
+                </div>
+                <button
+                  onClick={fetchSentRequests}
+                  disabled={sentRequestsLoading}
+                  style={{
+                    padding: "6px 12px", borderRadius: 8,
+                    border: "1px solid var(--border-subtle)",
+                    background: "transparent", color: "var(--text-secondary)",
+                    fontSize: 12, fontWeight: 600, cursor: "pointer",
+                    display: "flex", alignItems: "center", gap: 5,
+                    opacity: sentRequestsLoading ? 0.5 : 1,
+                  }}
+                >
+                  <RefreshCw size={12} style={{ animation: sentRequestsLoading ? "spin 1s linear infinite" : "none" }} />
+                  Refresh
+                </button>
+              </div>
+
+              {/* Body */}
+              <div style={{ flex: 1, padding: "16px 20px 20px", overflowY: "auto", maxHeight: 460 }}>
+                {sentRequestsLoading ? (
+                  <div style={{ textAlign: "center", padding: "50px 0", color: "var(--text-muted)" }}>
+                    <span className="spinner" style={{ width: 24, height: 24, margin: "0 auto 12px", display: "block" }} />
+                    <div style={{ fontSize: 13 }}>Loading requests...</div>
+                  </div>
+                ) : sentRequests.length === 0 ? (
+                  <div style={{ textAlign: "center", padding: "50px 20px" }}>
+                    <div style={{
+                      width: 56, height: 56, borderRadius: "50%",
+                      background: "rgba(99,102,241,0.1)",
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      margin: "0 auto 14px",
+                    }}>
+                      <Send size={22} color="rgba(99,102,241,0.5)" />
+                    </div>
+                    <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-secondary)" }}>No requests sent yet</div>
+                    <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 4 }}>
+                      Send your first request using the form on the left.
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    {sentRequests.map(req => {
+                      const statusColor = req.status === "approved" ? "#22c55e" : req.status === "rejected" ? "#ef4444" : "#f59e0b";
+                      const statusBg   = req.status === "approved" ? "rgba(34,197,94,0.1)" : req.status === "rejected" ? "rgba(239,68,68,0.1)" : "rgba(245,158,11,0.1)";
+                      const typeLabel  = req.requestType === "both" ? "View & Upload" : req.requestType === "view" ? "View Only" : "Upload Only";
+                      return (
+                        <div key={req._id} style={{
+                          padding: "14px 16px",
+                          borderRadius: 12,
+                          background: "var(--bg-tertiary, rgba(255,255,255,0.04))",
+                          border: "1px solid var(--border-subtle)",
+                          transition: "border-color 0.15s",
+                        }}>
+                          {/* Top row */}
+                          <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10, marginBottom: 8 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                              <div style={{
+                                width: 36, height: 36, borderRadius: "50%",
+                                background: "rgba(99,102,241,0.15)", color: "#6366f1",
+                                display: "flex", alignItems: "center", justifyContent: "center",
+                                fontWeight: 800, fontSize: 14, flexShrink: 0,
+                              }}>
+                                {(req.patientName || "?").charAt(0).toUpperCase()}
+                              </div>
+                              <div>
+                                <div style={{ fontWeight: 700, fontSize: 13, color: "var(--text-primary)" }}>{req.patientName}</div>
+                                <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 1 }}>{req.patientEmail}</div>
+                              </div>
+                            </div>
+                            <span style={{
+                              fontSize: 10, fontWeight: 800, padding: "3px 9px",
+                              borderRadius: 99, background: statusBg, color: statusColor,
+                              letterSpacing: "0.05em", whiteSpace: "nowrap", flexShrink: 0,
+                            }}>
+                              {req.status.toUpperCase()}
+                            </span>
+                          </div>
+
+                          {/* Meta pills */}
+                          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                            <span style={{
+                              fontSize: 11, padding: "2px 8px", borderRadius: 99,
+                              background: "rgba(99,102,241,0.1)", color: "#6366f1", fontWeight: 600,
+                            }}>
+                              {typeLabel}
+                            </span>
+                            <span style={{
+                              fontSize: 11, padding: "2px 8px", borderRadius: 99,
+                              background: "var(--bg-tertiary)", color: "var(--text-muted)", fontWeight: 500,
+                            }}>
+                              {new Date(req.createdAt).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}
+                            </span>
+                          </div>
+
+                          {/* Message */}
+                          {req.message && (
+                            <div style={{
+                              marginTop: 8, padding: "8px 10px",
+                              borderRadius: 8,
+                              background: "rgba(255,255,255,0.03)",
+                              border: "1px solid var(--border-subtle)",
+                              fontSize: 12, color: "var(--text-muted)",
+                              fontStyle: "italic", lineHeight: 1.5,
+                            }}>
+                              "{req.message}"
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+
+          </div>
+        </div>
+      )}
+      {/* ── Record Viewer & Verification Modal ── */}
+      {selectedRecordForViewer && (
+        <RecordViewerModal
+          record={selectedRecordForViewer}
+          patientAddress={resolvedPatient?.walletAddress || bioData?.patient?.walletAddress}
+          contract={contract}
+          currentUserRole="doctor"
+          onClose={() => setSelectedRecordForViewer(null)}
+        />
       )}
     </>
   );
